@@ -74,7 +74,6 @@ def _discover_tools():
     """
     _modules = [
         "tools.web_tools",
-        "tools.parallel_web_tools",
         "tools.terminal_tool",
         "tools.file_tools",
         "tools.vision_tools",

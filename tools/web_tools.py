@@ -1,39 +1,18 @@
 #!/usr/bin/env python3
 """
-Standalone Web Tools Module
+Web Tools Module
 
-This module provides generic web tools that work with multiple backend providers.
-Currently uses Firecrawl as the backend, and the interface makes it easy to swap
-providers without changing the function signatures.
+Provides web search and content extraction with two backend providers:
+- **Firecrawl**: search, extract, and crawl (https://docs.firecrawl.dev)
+- **Parallel**: search and extract (https://docs.parallel.ai)
 
-Available tools:
-- web_search_tool: Search the web for information
-- web_extract_tool: Extract content from specific web pages
-- web_crawl_tool: Crawl websites with specific instructions
-
-Backend compatibility:
-- Firecrawl: https://docs.firecrawl.dev/introduction
+Backend selection is controlled by the ``web_search_backend`` config key
+(auto / parallel / firecrawl).  "auto" prefers Parallel when PARALLEL_API_KEY
+is set, otherwise falls back to Firecrawl.
 
 LLM Processing:
-- Uses OpenRouter API with Gemini 3 Flash Preview for intelligent content extraction
-- Extracts key excerpts and creates markdown summaries to reduce token usage
-
-Debug Mode:
-- Set WEB_TOOLS_DEBUG=true to enable detailed logging
-- Creates web_tools_debug_UUID.json in ./logs directory
-- Captures all tool calls, results, and compression metrics
-
-Usage:
-    from web_tools import web_search_tool, web_extract_tool, web_crawl_tool
-    
-    # Search the web
-    results = web_search_tool("Python machine learning libraries", limit=3)
-    
-    # Extract content from URLs  
-    content = web_extract_tool(["https://example.com"], format="markdown")
-    
-    # Crawl a website
-    crawl_data = web_crawl_tool("example.com", "Find contact information")
+- Large pages are chunked, summarized, and synthesized via an auxiliary model
+- Set WEB_TOOLS_DEBUG=true or PARALLEL_TOOLS_DEBUG=true for debug logs
 """
 
 #TODO: Search Capabilities over the scraped pages
@@ -51,9 +30,106 @@ from openai import AsyncOpenAI
 from agent.auxiliary_client import get_async_text_auxiliary_client
 from tools.debug_helpers import DebugSession
 
+try:
+    from parallel import AsyncParallel, Parallel
+except ImportError:  # parallel SDK not installed
+    AsyncParallel = None  # type: ignore[assignment,misc]
+    Parallel = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION = 5000
+
+# Resolve async auxiliary client at module level.
+# Handles Codex Responses API adapter transparently.
+_aux_async_client, DEFAULT_SUMMARIZER_MODEL = get_async_text_auxiliary_client()
+
+# ---------------------------------------------------------------------------
+# Backend configuration (Parallel / Firecrawl / auto)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SEARCH_MODE = "fast"
+_DEFAULT_TASK_PROCESSOR = "pro"
+_VALID_SEARCH_MODES = ("ultra-fast", "fast", "one-shot", "agentic")
+_VALID_TASK_PROCESSORS = ("lite", "base", "core", "pro", "ultra")
+
+
+def get_parallel_api_key():
+    """Return the Parallel API key, or None if not set."""
+    return os.getenv("PARALLEL_API_KEY") or None
+
+
+def is_parallel_available():
+    """Check if Parallel API key is configured and SDK is installed."""
+    return Parallel is not None and bool(get_parallel_api_key())
+
+
+def get_search_mode():
+    """Return the Parallel search mode (ultra-fast, fast, one-shot, agentic)."""
+    mode = os.getenv("PARALLEL_SEARCH_MODE", _DEFAULT_SEARCH_MODE).lower()
+    if mode not in _VALID_SEARCH_MODES:
+        logger.warning(
+            "Invalid PARALLEL_SEARCH_MODE '%s', using '%s'", mode, _DEFAULT_SEARCH_MODE
+        )
+        return _DEFAULT_SEARCH_MODE
+    return mode
+
+
+def get_task_processor():
+    """Return the Parallel Task API processor tier."""
+    proc = os.getenv("PARALLEL_TASK_PROCESSOR", _DEFAULT_TASK_PROCESSOR).lower()
+    if proc not in _VALID_TASK_PROCESSORS:
+        logger.warning(
+            "Invalid PARALLEL_TASK_PROCESSOR '%s', using '%s'",
+            proc, _DEFAULT_TASK_PROCESSOR,
+        )
+        return _DEFAULT_TASK_PROCESSOR
+    return proc
+
+
+def get_web_search_backend():
+    """Return the active web search backend: 'parallel', 'firecrawl', or 'none'.
+
+    Reads ``web_search_backend`` from config.yaml (default: ``'auto'``).
+    """
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        backend = config.get("web_search_backend", "auto")
+    except Exception:
+        backend = os.getenv("WEB_SEARCH_BACKEND", "auto")
+
+    backend = str(backend).lower().strip()
+
+    if backend == "parallel":
+        return "parallel"
+    elif backend == "firecrawl":
+        return "firecrawl"
+    elif backend == "auto":
+        if is_parallel_available():
+            return "parallel"
+        elif os.getenv("FIRECRAWL_API_KEY"):
+            return "firecrawl"
+        return "none"
+    else:
+        logger.warning("Unknown web_search_backend '%s', using auto", backend)
+        if is_parallel_available():
+            return "parallel"
+        elif os.getenv("FIRECRAWL_API_KEY"):
+            return "firecrawl"
+        return "none"
+
+
+# ---------------------------------------------------------------------------
+# Firecrawl client (lazy)
+# ---------------------------------------------------------------------------
+
 _firecrawl_client = None
+
 
 def _get_firecrawl_client():
     """Get or create the Firecrawl client (lazy initialization)."""
@@ -65,13 +141,53 @@ def _get_firecrawl_client():
         _firecrawl_client = Firecrawl(api_key=api_key)
     return _firecrawl_client
 
-DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION = 5000
 
-# Resolve async auxiliary client at module level.
-# Handles Codex Responses API adapter transparently.
-_aux_async_client, DEFAULT_SUMMARIZER_MODEL = get_async_text_auxiliary_client()
+def check_firecrawl_api_key():
+    """Check if the Firecrawl API key is available."""
+    return bool(os.getenv("FIRECRAWL_API_KEY"))
+
+
+# ---------------------------------------------------------------------------
+# Parallel client (lazy)
+# ---------------------------------------------------------------------------
+
+_parallel_client = None
+_async_parallel_client = None
+
+
+def _get_parallel_client():
+    """Get or create the sync Parallel client (lazy initialization)."""
+    global _parallel_client
+    if _parallel_client is None:
+        api_key = get_parallel_api_key()
+        if not api_key:
+            raise ValueError("PARALLEL_API_KEY environment variable not set")
+        _parallel_client = Parallel(api_key=api_key)
+    return _parallel_client
+
+
+def _get_async_parallel_client():
+    """Get or create the async Parallel client (lazy initialization)."""
+    global _async_parallel_client
+    if _async_parallel_client is None:
+        api_key = get_parallel_api_key()
+        if not api_key:
+            raise ValueError("PARALLEL_API_KEY environment variable not set")
+        _async_parallel_client = AsyncParallel(api_key=api_key)
+    return _async_parallel_client
+
+
+def check_parallel_api_key():
+    """Check if the Parallel API key is available."""
+    return bool(get_parallel_api_key())
+
+
+# ---------------------------------------------------------------------------
+# Debug sessions
+# ---------------------------------------------------------------------------
 
 _debug = DebugSession("web_tools", env_var="WEB_TOOLS_DEBUG")
+_parallel_debug = DebugSession("parallel_tools", env_var="PARALLEL_TOOLS_DEBUG")
 
 
 async def process_content_with_llm(
@@ -1102,21 +1218,286 @@ async def web_crawl_tool(
         return json.dumps({"error": error_msg}, ensure_ascii=False)
 
 
-# Convenience function to check if API key is available
-def check_firecrawl_api_key() -> bool:
-    """
-    Check if the Firecrawl API key is available in environment variables.
-    
-    Returns:
-        bool: True if API key is set, False otherwise
-    """
-    return bool(os.getenv("FIRECRAWL_API_KEY"))
-
-
 def check_auxiliary_model() -> bool:
     """Check if an auxiliary text model is available for LLM content processing."""
     return _aux_async_client is not None
 
+
+# ---------------------------------------------------------------------------
+# Parallel backend — search (synchronous)
+# ---------------------------------------------------------------------------
+
+def parallel_search_tool(query: str, limit: int = 5) -> str:
+    """Search the web using the Parallel Search API.
+
+    Returns results in the same JSON format as web_search_tool() for
+    seamless backend switching.
+    """
+    debug_call_data = {
+        "parameters": {"query": query, "limit": limit},
+        "error": None,
+        "results_count": 0,
+        "original_response_size": 0,
+        "final_response_size": 0,
+    }
+
+    try:
+        from tools.interrupt import is_interrupted
+
+        if is_interrupted():
+            return json.dumps({"error": "Interrupted", "success": False})
+
+        mode = get_search_mode()
+        logger.info(
+            "Searching the web for: '%s' (limit: %d, mode: %s)", query, limit, mode
+        )
+
+        client = _get_parallel_client()
+        response = client.beta.search(
+            search_queries=[query],
+            mode=mode,
+            max_results=limit,
+            excerpts={"max_chars_per_result": 10000},
+        )
+
+        web_results = []
+        results_list = response.results if hasattr(response, "results") else []
+
+        for idx, result in enumerate(results_list):
+            title = getattr(result, "title", None) or ""
+            url = getattr(result, "url", "") or ""
+            excerpts = getattr(result, "excerpts", None) or []
+            publish_date = getattr(result, "publish_date", None)
+
+            description = "\n\n".join(excerpts) if excerpts else ""
+
+            entry = {
+                "title": title,
+                "url": url,
+                "description": description,
+                "position": idx + 1,
+            }
+            if publish_date:
+                entry["publish_date"] = publish_date
+
+            web_results.append(entry)
+
+        results_count = len(web_results)
+        logger.info("Found %d search results", results_count)
+
+        response_data = {"success": True, "data": {"web": web_results}}
+
+        debug_call_data["results_count"] = results_count
+        result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+
+        debug_call_data["final_response_size"] = len(result_json)
+        _parallel_debug.log_call("parallel_search_tool", debug_call_data)
+        _parallel_debug.save()
+
+        return result_json
+
+    except Exception as e:
+        error_msg = f"Error searching web: {str(e)}"
+        logger.debug("%s", error_msg)
+
+        debug_call_data["error"] = error_msg
+        _parallel_debug.log_call("parallel_search_tool", debug_call_data)
+        _parallel_debug.save()
+
+        return json.dumps({"error": error_msg}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Parallel backend — extract (asynchronous)
+# ---------------------------------------------------------------------------
+
+async def parallel_extract_tool(
+    urls: List[str],
+    format: str = None,
+    use_llm_processing: bool = True,
+) -> str:
+    """Extract content from web pages using the Parallel Extract API.
+
+    Returns results in the same JSON format as web_extract_tool() for
+    seamless backend switching.
+    """
+    debug_call_data = {
+        "parameters": {
+            "urls": urls,
+            "format": format,
+            "use_llm_processing": use_llm_processing,
+        },
+        "error": None,
+        "pages_extracted": 0,
+        "pages_processed_with_llm": 0,
+        "original_response_size": 0,
+        "final_response_size": 0,
+        "compression_metrics": [],
+        "processing_applied": [],
+    }
+
+    try:
+        from tools.interrupt import is_interrupted as _is_interrupted
+
+        logger.info("Extracting content from %d URL(s) via Parallel", len(urls))
+
+        client = _get_async_parallel_client()
+
+        try:
+            response = await client.beta.extract(
+                urls=urls,
+                full_content=True,
+            )
+        except Exception as api_err:
+            logger.debug("Parallel extract API call failed: %s", api_err)
+            raise
+
+        results: List[Dict[str, Any]] = []
+        api_results = response.results if hasattr(response, "results") else []
+        api_errors = response.errors if hasattr(response, "errors") else []
+
+        error_urls: Dict[str, str] = {}
+        for err in api_errors:
+            err_url = getattr(err, "url", None) or ""
+            err_msg = getattr(err, "error", None) or str(err)
+            error_urls[err_url] = err_msg
+
+        for result in api_results:
+            url = getattr(result, "url", "") or ""
+            title = getattr(result, "title", "") or ""
+            full_content = getattr(result, "full_content", None) or ""
+            excerpts_list = getattr(result, "excerpts", None) or []
+
+            content = full_content or "\n\n".join(excerpts_list)
+
+            results.append({
+                "url": url,
+                "title": title,
+                "content": content,
+                "raw_content": content,
+            })
+
+        result_urls = {r["url"] for r in results}
+        for url in urls:
+            if url not in result_urls:
+                err_msg = error_urls.get(url, "Extraction failed")
+                results.append({
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": err_msg,
+                })
+
+        pages_extracted = len([r for r in results if r.get("raw_content")])
+        logger.info("Extracted content from %d pages", pages_extracted)
+
+        debug_call_data["pages_extracted"] = pages_extracted
+        debug_call_data["original_response_size"] = sum(
+            len(r.get("raw_content", "")) for r in results
+        )
+
+        if use_llm_processing:
+            logger.info("Processing extracted content with LLM (parallel)...")
+            debug_call_data["processing_applied"].append("llm_processing")
+
+            async def process_single_result(result):
+                if _is_interrupted():
+                    return result, None, "interrupted"
+
+                url = result.get("url", "Unknown URL")
+                title = result.get("title", "")
+                raw_content = result.get("raw_content", "")
+
+                if not raw_content:
+                    return result, None, "no_content"
+
+                original_size = len(raw_content)
+
+                processed = await process_content_with_llm(
+                    raw_content, url, title
+                )
+
+                if processed:
+                    processed_size = len(processed)
+                    compression_ratio = (
+                        processed_size / original_size if original_size > 0 else 1.0
+                    )
+                    result["content"] = processed
+                    metrics = {
+                        "url": url,
+                        "original_size": original_size,
+                        "processed_size": processed_size,
+                        "compression_ratio": compression_ratio,
+                    }
+                    return result, metrics, "processed"
+                else:
+                    metrics = {
+                        "url": url,
+                        "original_size": original_size,
+                        "processed_size": original_size,
+                        "compression_ratio": 1.0,
+                        "reason": "content_too_short",
+                    }
+                    return result, metrics, "too_short"
+
+            tasks = [process_single_result(r) for r in results]
+            processed_results = await asyncio.gather(*tasks)
+
+            for result, metrics, status in processed_results:
+                url = result.get("url", "Unknown URL")
+                if status == "processed":
+                    debug_call_data["compression_metrics"].append(metrics)
+                    debug_call_data["pages_processed_with_llm"] += 1
+                    logger.info("%s (processed)", url)
+                elif status == "too_short":
+                    if metrics:
+                        debug_call_data["compression_metrics"].append(metrics)
+                    logger.info("%s (no processing - content too short)", url)
+                else:
+                    logger.info("%s (%s)", url, status)
+
+        trimmed_results = [
+            {
+                "title": r.get("title", ""),
+                "content": r.get("content", ""),
+                "error": r.get("error"),
+            }
+            for r in results
+        ]
+        trimmed_response = {"results": trimmed_results}
+
+        if not any(r.get("content") for r in trimmed_results):
+            result_json = json.dumps(
+                {"error": "Content was inaccessible or not found"}, ensure_ascii=False
+            )
+        else:
+            result_json = json.dumps(trimmed_response, indent=2, ensure_ascii=False)
+
+        cleaned_result = clean_base64_images(result_json)
+
+        debug_call_data["final_response_size"] = len(cleaned_result)
+        debug_call_data["processing_applied"].append("base64_image_removal")
+
+        _parallel_debug.log_call("parallel_extract_tool", debug_call_data)
+        _parallel_debug.save()
+
+        return cleaned_result
+
+    except Exception as e:
+        error_msg = f"Error extracting content: {str(e)}"
+        logger.debug("%s", error_msg)
+
+        debug_call_data["error"] = error_msg
+        _parallel_debug.log_call("parallel_extract_tool", debug_call_data)
+        _parallel_debug.save()
+
+        return json.dumps({"error": error_msg}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def get_debug_session_info() -> Dict[str, Any]:
     """Get information about the current debug session."""
@@ -1210,7 +1591,6 @@ if __name__ == "__main__":
 # Registry — backend-aware routing
 # ---------------------------------------------------------------------------
 from tools.registry import registry
-from tools.parallel_config import get_web_search_backend, get_search_mode
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
@@ -1247,11 +1627,6 @@ WEB_EXTRACT_SCHEMA = {
 _web_backend = get_web_search_backend()
 
 if _web_backend == "parallel":
-    from tools.parallel_web_tools import (
-        parallel_search_tool,
-        parallel_extract_tool,
-        check_parallel_api_key,
-    )
     logger.info("Web search backend: Parallel (%s mode)", get_search_mode())
 
     registry.register(
