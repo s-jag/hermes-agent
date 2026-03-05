@@ -1207,9 +1207,10 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# Registry
+# Registry — backend-aware routing
 # ---------------------------------------------------------------------------
 from tools.registry import registry
+from tools.parallel_config import get_web_search_backend, get_search_mode
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
@@ -1243,21 +1244,53 @@ WEB_EXTRACT_SCHEMA = {
     }
 }
 
-registry.register(
-    name="web_search",
-    toolset="web",
-    schema=WEB_SEARCH_SCHEMA,
-    handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=5),
-    check_fn=check_firecrawl_api_key,
-    requires_env=["FIRECRAWL_API_KEY"],
-)
-registry.register(
-    name="web_extract",
-    toolset="web",
-    schema=WEB_EXTRACT_SCHEMA,
-    handler=lambda args, **kw: web_extract_tool(
-        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
-    check_fn=check_firecrawl_api_key,
-    requires_env=["FIRECRAWL_API_KEY"],
-    is_async=True,
-)
+_web_backend = get_web_search_backend()
+
+if _web_backend == "parallel":
+    from tools.parallel_web_tools import (
+        parallel_search_tool,
+        parallel_extract_tool,
+        check_parallel_api_key,
+    )
+    logger.info("Web search backend: Parallel (%s mode)", get_search_mode())
+
+    registry.register(
+        name="web_search",
+        toolset="web",
+        schema=WEB_SEARCH_SCHEMA,
+        handler=lambda args, **kw: parallel_search_tool(args.get("query", ""), limit=5),
+        check_fn=check_parallel_api_key,
+        requires_env=["PARALLEL_API_KEY"],
+    )
+    registry.register(
+        name="web_extract",
+        toolset="web",
+        schema=WEB_EXTRACT_SCHEMA,
+        handler=lambda args, **kw: parallel_extract_tool(
+            args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
+        check_fn=check_parallel_api_key,
+        requires_env=["PARALLEL_API_KEY"],
+        is_async=True,
+    )
+else:
+    if _web_backend == "firecrawl":
+        logger.info("Web search backend: Firecrawl")
+
+    registry.register(
+        name="web_search",
+        toolset="web",
+        schema=WEB_SEARCH_SCHEMA,
+        handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=5),
+        check_fn=check_firecrawl_api_key,
+        requires_env=["FIRECRAWL_API_KEY"],
+    )
+    registry.register(
+        name="web_extract",
+        toolset="web",
+        schema=WEB_EXTRACT_SCHEMA,
+        handler=lambda args, **kw: web_extract_tool(
+            args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
+        check_fn=check_firecrawl_api_key,
+        requires_env=["FIRECRAWL_API_KEY"],
+        is_async=True,
+    )

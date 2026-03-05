@@ -63,6 +63,7 @@ DEFAULT_CONFIG = {
     "model": "anthropic/claude-opus-4.6",
     "toolsets": ["hermes-cli"],
     "max_turns": 100,
+    "web_search_backend": "auto",
     
     "terminal": {
         "backend": "local",
@@ -176,6 +177,14 @@ OPTIONAL_ENV_VARS = {
         "prompt": "Firecrawl API key",
         "url": "https://firecrawl.dev/",
         "tools": ["web_search", "web_extract"],
+        "password": True,
+        "category": "tool",
+    },
+    "PARALLEL_API_KEY": {
+        "description": "Parallel API key for web search, extract, deep research, and entity discovery",
+        "prompt": "Parallel API key",
+        "url": "https://parallel.ai/",
+        "tools": ["web_search", "web_extract", "parallel_research", "parallel_findall"],
         "password": True,
         "category": "tool",
     },
@@ -722,6 +731,7 @@ def show_config():
         ("ANTHROPIC_API_KEY", "Anthropic"),
         ("VOICE_TOOLS_OPENAI_KEY", "OpenAI (STT/TTS)"),
         ("FIRECRAWL_API_KEY", "Firecrawl"),
+        ("PARALLEL_API_KEY", "Parallel"),
         ("BROWSERBASE_API_KEY", "Browserbase"),
         ("FAL_KEY", "FAL"),
     ]
@@ -821,7 +831,7 @@ def set_config_value(key: str, value: str):
     # Check if it's an API key (goes to .env)
     api_keys = [
         'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
-        'FIRECRAWL_API_KEY', 'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID',
+        'FIRECRAWL_API_KEY', 'PARALLEL_API_KEY', 'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',
         'SUDO_PASSWORD', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',

@@ -149,6 +149,15 @@ terminal:
 #   sudo_password: "your-password-here"
 
 # =============================================================================
+# Web Search Backend
+# =============================================================================
+# Controls which web search provider is used for web_search and web_extract tools.
+#   "auto"      - Use Parallel if PARALLEL_API_KEY is set, otherwise Firecrawl (default)
+#   "parallel"  - Always use Parallel (requires PARALLEL_API_KEY in .env)
+#   "firecrawl" - Always use Firecrawl (requires FIRECRAWL_API_KEY in .env)
+web_search_backend: auto
+
+# =============================================================================
 # Browser Tool Configuration
 # =============================================================================
 browser:
